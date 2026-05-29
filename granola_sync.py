@@ -242,8 +242,8 @@ def get_granola_token(force_reauth: bool = False) -> str:
     return tokens["access_token"]
 
 
-def get_adaptor_token() -> str:
-    """Read the Salesforce MCP gateway token from macOS keychain."""
+def _read_adaptor_blob() -> tuple[str, dict]:
+    """Return (raw_keychain_string, parsed_blob_dict) from the keychain."""
     result = subprocess.run(
         ["security", "find-generic-password", "-s", ADAPTOR_SERVICE,
          "-a", ADAPTOR_ACCOUNT, "-w"],
@@ -251,8 +251,76 @@ def get_adaptor_token() -> str:
     )
     raw = result.stdout.strip()
     decoded = base64.b64decode(raw + "==").decode("utf-8", errors="replace")
-    parsed = json.loads(decoded)
-    return parsed["access_token"]
+    return raw, json.loads(decoded)
+
+
+def _refresh_adaptor_token(blob: dict) -> str:
+    """Use the refresh_token in the keychain blob to get a fresh access_token.
+
+    Updates the keychain entry in-place and returns the new access_token.
+    """
+    issuer = blob.get("issuer", "")
+    token_url = f"{issuer}/protocol/openid-connect/token"
+    refresh_token = blob.get("refresh_token", "")
+    if not refresh_token:
+        raise RuntimeError("No refresh_token in keychain blob — run Claude Code to re-authenticate.")
+
+    ctx = ssl.create_default_context(cafile=CA_CERT) if Path(CA_CERT).exists() else ssl.create_default_context()
+    opener = urllib.request.build_opener(
+        urllib.request.ProxyHandler({}),
+        urllib.request.HTTPSHandler(context=ctx),
+    )
+
+    body = urllib.parse.urlencode({
+        "grant_type": "refresh_token",
+        "client_id": "dx-mcp-adaptor",
+        "refresh_token": refresh_token,
+    }).encode()
+    req = urllib.request.Request(
+        token_url, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    with opener.open(req, timeout=15) as resp:
+        new_tokens = json.loads(resp.read().decode())
+
+    access_token = new_tokens["access_token"]
+    blob["access_token"] = access_token
+    if "refresh_token" in new_tokens:
+        blob["refresh_token"] = new_tokens["refresh_token"]
+    blob["last_refreshed"] = datetime.now(timezone.utc).isoformat()
+
+    # Write back to keychain
+    new_raw = base64.b64encode(json.dumps(blob).encode()).decode()
+    subprocess.run(
+        ["security", "add-generic-password", "-U",
+         "-s", ADAPTOR_SERVICE, "-a", ADAPTOR_ACCOUNT, "-w", new_raw],
+        capture_output=True, check=True
+    )
+    return access_token
+
+
+def get_adaptor_token() -> str:
+    """Read the Salesforce MCP gateway token from the keychain, refreshing if expired."""
+    _, blob = _read_adaptor_blob()
+    access_token = blob.get("access_token", "")
+
+    # Check expiry — refresh proactively if within 5 minutes of expiry or already expired
+    expires_at_str = blob.get("expires_at", "")
+    if expires_at_str and access_token:
+        try:
+            # Parse the ISO timestamp (handles both Z and ±HH:MM offsets)
+            expires_at = datetime.fromisoformat(expires_at_str)
+            now = datetime.now(timezone.utc)
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            if now >= expires_at - timedelta(minutes=5):
+                print("  ↻ MCP adaptor token expired — refreshing…")
+                access_token = _refresh_adaptor_token(blob)
+                print("  ✓ Token refreshed.")
+        except Exception as e:
+            print(f"  ⚠ Could not check token expiry: {e}", file=sys.stderr)
+
+    return access_token
 
 
 # ---------------------------------------------------------------------------
@@ -460,6 +528,12 @@ class GWorkspaceClient:
         self._session_id: str | None = None
         self._req_id = 1
         self._ctx = ssl.create_default_context(cafile=CA_CERT)
+        # Build a proxy-free opener so Claude Code's localhost proxy doesn't
+        # intercept direct calls to the Salesforce MCP gateway.
+        self._opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=self._ctx),
+        )
         self._initialize()
 
     def _headers(self) -> dict:
@@ -484,7 +558,7 @@ class GWorkspaceClient:
             },
         }).encode()
         req = urllib.request.Request(self._mcp_url, data=payload, headers=self._headers())
-        with urllib.request.urlopen(req, context=self._ctx, timeout=15) as resp:
+        with self._opener.open(req, timeout=15) as resp:
             self._session_id = resp.headers.get("Mcp-Session-Id", "")
             resp.read()  # consume body
 
@@ -498,7 +572,7 @@ class GWorkspaceClient:
             "params": params,
         }).encode()
         req = urllib.request.Request(self._mcp_url, data=payload, headers=self._headers())
-        with urllib.request.urlopen(req, context=self._ctx, timeout=30) as resp:
+        with self._opener.open(req, timeout=30) as resp:
             body = resp.read().decode()
         if not body.strip():
             return {}
@@ -1336,8 +1410,12 @@ def check_setup() -> bool:
             f"{GW_BASE}/v1/profile/{GW_PROFILE}/mcp",
             headers={"Content-Type": "application/json", "Accept": "application/json"},
         )
+        no_proxy_opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}),
+            urllib.request.HTTPSHandler(context=ctx),
+        )
         try:
-            with urllib.request.urlopen(req, context=ctx, timeout=10):
+            with no_proxy_opener.open(req, timeout=10):
                 pass
         except urllib.error.HTTPError:
             pass  # Any HTTP response means the gateway is reachable
