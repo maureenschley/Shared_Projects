@@ -1,34 +1,30 @@
 ---
 name: granola-sync
-description: Run the Granola → Google Docs sync to pull the latest meeting notes into Drive. Accepts optional flags like --days N, --dry-run, or --check.
+description: Show the command to run the Granola → Google Docs sync. NOTE — the sync cannot run inside Claude Code due to network sandbox restrictions. This skill tells you the right command to run in a regular Terminal window instead.
 allowed-tools: Bash(python3 *)
 argument-hint: "[--days N] [--dry-run] [--check]"
 ---
 
-Run the Granola → Google Docs sync script.
+The Granola sync script cannot run inside Claude Code — the Bash sandbox
+blocks access to the internal Salesforce network endpoints the script needs.
 
-## Steps
+**Run it directly in a Terminal window instead:**
 
-1. Run the sync script, passing through any arguments the user provided:
-   ```
-   python3 ~/granola_sync.py <args>
-   ```
-   Common invocations:
-   - No args → sync the last 30 days: `python3 ~/granola_sync.py`
-   - Preview without writing: `python3 ~/granola_sync.py --dry-run`
-   - Sync further back: `python3 ~/granola_sync.py --days 90`
-   - Check prerequisites: `python3 ~/granola_sync.py --check`
+```
+python3 ~/granola_sync.py
+```
 
-2. Show the full output from the script to the user.
+## Common commands
 
-3. Summarize what happened in plain language:
-   - How many meetings were synced (created as new docs)
-   - How many were skipped (already exist)
-   - Any errors or warnings
-   - If `--dry-run` was used, clarify that nothing was written
+| What you want | Command |
+|---|---|
+| Sync last 30 days (default) | `python3 ~/granola_sync.py` |
+| Preview without writing | `python3 ~/granola_sync.py --dry-run` |
+| Sync further back | `python3 ~/granola_sync.py --days 90` |
+| Check prerequisites | `python3 ~/granola_sync.py --check` |
 
 ## Notes
 
-- The script runs silently on success with a summary line; errors are printed to stderr
-- If the script exits non-zero, show the error output and suggest running `python3 ~/granola_sync.py --check` to diagnose
-- Do not modify the script or Drive contents — this skill is run-only
+- The script auto-refreshes its auth token if expired — no manual re-auth needed
+- A cron job runs the sync automatically at 8am, 12pm, 4pm, and 8pm
+- See the README in the repo for full setup instructions
