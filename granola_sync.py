@@ -1021,7 +1021,8 @@ def backfill_transcripts(folder_name: str = "Granola Meeting Notes", dry_run: bo
 
 def sync(days: int = 30, folder_name: str = "Granola Meeting Notes", dry_run: bool = False,
          reauth: bool = False):
-    print(f"{'[DRY RUN] ' if dry_run else ''}Starting Granola → Google Docs sync")
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    print(f"\n[{ts}] {'[DRY RUN] ' if dry_run else ''}Starting Granola → Google Docs sync")
     print(f"  Range: last {days} days  |  Folder: {folder_name}\n")
 
     print("Authenticating...")
