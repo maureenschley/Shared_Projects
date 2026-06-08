@@ -1466,8 +1466,22 @@ def check_setup() -> bool:
 # Duplicate detection
 # ---------------------------------------------------------------------------
 
+def _doc_tab_count(gw: GWorkspaceClient, doc_id: str) -> int:
+    """Return the number of tabs in a doc (1 = old single-tab, 2+ = new format)."""
+    try:
+        structure = gw.inspect_doc(doc_id)
+        tabs = structure.get("tabs", [])
+        return len(tabs) if tabs else 1
+    except Exception:
+        return 0  # unknown
+
+
 def find_duplicate_docs(folder_name: str = "Granola Meeting Notes"):
-    """Scan the Drive folder and report meetings with more than one synced doc."""
+    """Scan the Drive folder and report meetings with more than one synced doc.
+
+    For each duplicate pair, checks how many tabs each doc has and marks the
+    two-tab doc (new format) as KEEP and the single-tab doc (old format) as TRASH.
+    """
     print(f"Scanning '{folder_name}' for duplicate docs…\n")
 
     print("Authenticating...")
@@ -1482,7 +1496,6 @@ def find_duplicate_docs(folder_name: str = "Granola Meeting Notes"):
     doc_ids = re.findall(r"ID[:\s]+([A-Za-z0-9_-]{25,})", text)
     print(f"  Found {len(doc_ids)} docs — reading each to extract Granola ID…\n")
 
-    # granola_id → list of (doc_id, doc_title_snippet)
     seen: dict[str, list[str]] = {}
     unreadable = []
 
@@ -1510,14 +1523,30 @@ def find_duplicate_docs(folder_name: str = "Granola Meeting Notes"):
     if not dupes:
         print("✓ No duplicate docs found.")
     else:
-        print(f"Found {len(dupes)} meeting(s) with duplicate docs:\n")
+        print(f"Found {len(dupes)} meeting(s) with duplicate docs.")
+        print("Checking tab structure to identify which to keep…\n")
+
+        trash_urls = []
         for gid, ids in dupes.items():
+            tab_counts = {doc_id: _doc_tab_count(gw, doc_id) for doc_id in ids}
+            # Prefer the doc with the most tabs (two-tab = new format)
+            best = max(tab_counts, key=lambda d: tab_counts[d])
+            rest = [d for d in ids if d != best]
+
             print(f"  Granola ID: {gid}")
-            for doc_id in ids:
-                print(f"    https://docs.google.com/document/d/{doc_id}/edit")
+            print(f"    ✅ KEEP  ({tab_counts[best]} tab{'s' if tab_counts[best] != 1 else ''})  "
+                  f"https://docs.google.com/document/d/{best}/edit")
+            for d in rest:
+                url = f"https://docs.google.com/document/d/{d}/edit"
+                print(f"    🗑  TRASH ({tab_counts[d]} tab{'s' if tab_counts[d] != 1 else ''})  {url}")
+                trash_urls.append(url)
             print()
-        print("To clean up: open each group above, keep the newest doc,")
-        print("and move the older one(s) to Trash in Google Drive.")
+
+        print(f"{'='*60}")
+        print(f"\n{len(trash_urls)} doc(s) to move to Trash in Google Drive:\n")
+        for url in trash_urls:
+            print(f"  {url}")
+        print("\nOpen each 🗑 TRASH link → File → Move to Trash.")
 
     if unreadable:
         print(f"\n⚠ {len(unreadable)} doc(s) could not be read (no granola_id extracted):")
