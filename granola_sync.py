@@ -914,19 +914,38 @@ def format_doc(meeting: dict, transcript: str = "") -> tuple[str, str]:
 # Deduplication: scan docs in folder for embedded granola_ids
 # ---------------------------------------------------------------------------
 
-def build_synced_index(gw: GWorkspaceClient, folder_id: str) -> dict[str, str]:
-    """Return {granola_id: doc_id} for all already-synced docs in the folder."""
+def build_synced_index(gw: GWorkspaceClient, folder_id: str,
+                       verbose: bool = False) -> dict[str, str]:
+    """Return {granola_id: doc_id} for all already-synced docs in the folder.
+
+    For two-tab docs, get_doc_as_markdown may return a 'session expired' error
+    on the default call. We fall back to reading Tab 1 (t.0) explicitly so the
+    granola_id is never missed and duplicates aren't created.
+    """
     text = gw.call_tool("list_docs_in_folder", {"folder_id": folder_id, "page_size": 200})
     index = {}
     doc_ids = re.findall(r"ID[:\s]+([A-Za-z0-9_-]{25,})", text)
+    skipped = []
     for doc_id in doc_ids:
         try:
             body = gw.get_doc_content(doc_id)
+            # If the call returned a session-expired error (tabbed doc quirk),
+            # retry with an explicit tab_id for the Notes tab.
+            if "session expired" in body.lower() or not body.strip():
+                body = gw.call_tool("get_doc_as_markdown",
+                                    {"document_id": doc_id, "tab_id": "t.0"})
             m = GRANOLA_ID_RE.search(body)
             if m:
                 index[m.group(1)] = doc_id
-        except Exception:
-            pass
+            elif verbose:
+                print(f"    ⚠ No granola_id found in {doc_id}")
+        except Exception as e:
+            skipped.append((doc_id, str(e)))
+    if skipped:
+        print(f"  ⚠ Could not read {len(skipped)} doc(s) while building index "
+              f"(may cause duplicate creation):", file=sys.stderr)
+        for doc_id, err in skipped:
+            print(f"    {doc_id}: {err}", file=sys.stderr)
     return index
 
 
@@ -1436,6 +1455,72 @@ def check_setup() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Duplicate detection
+# ---------------------------------------------------------------------------
+
+def find_duplicate_docs(folder_name: str = "Granola Meeting Notes"):
+    """Scan the Drive folder and report meetings with more than one synced doc."""
+    print(f"Scanning '{folder_name}' for duplicate docs…\n")
+
+    print("Authenticating...")
+    adaptor_token = get_adaptor_token()
+    print("Connecting to Google Workspace MCP gateway...")
+    gw = GWorkspaceClient(adaptor_token)
+
+    folder_id = gw.ensure_folder(folder_name)
+    print(f"  Folder ID: {folder_id}\n")
+
+    text = gw.call_tool("list_docs_in_folder", {"folder_id": folder_id, "page_size": 200})
+    doc_ids = re.findall(r"ID[:\s]+([A-Za-z0-9_-]{25,})", text)
+    print(f"  Found {len(doc_ids)} docs — reading each to extract Granola ID…\n")
+
+    # granola_id → list of (doc_id, doc_title_snippet)
+    seen: dict[str, list[str]] = {}
+    unreadable = []
+
+    for i, doc_id in enumerate(doc_ids, 1):
+        try:
+            body = gw.get_doc_content(doc_id)
+            if "session expired" in body.lower() or not body.strip():
+                body = gw.call_tool("get_doc_as_markdown",
+                                    {"document_id": doc_id, "tab_id": "t.0"})
+            m = GRANOLA_ID_RE.search(body)
+            if m:
+                gid = m.group(1)
+                seen.setdefault(gid, []).append(doc_id)
+            else:
+                unreadable.append(doc_id)
+            if i % 10 == 0:
+                print(f"  … read {i}/{len(doc_ids)}")
+        except Exception as e:
+            unreadable.append(doc_id)
+            print(f"  ⚠ Could not read {doc_id}: {e}", file=sys.stderr)
+
+    dupes = {gid: ids for gid, ids in seen.items() if len(ids) > 1}
+
+    print(f"\n{'='*60}")
+    if not dupes:
+        print("✓ No duplicate docs found.")
+    else:
+        print(f"Found {len(dupes)} meeting(s) with duplicate docs:\n")
+        for gid, ids in dupes.items():
+            print(f"  Granola ID: {gid}")
+            for doc_id in ids:
+                print(f"    https://docs.google.com/document/d/{doc_id}/edit")
+            print()
+        print("To clean up: open each group above, keep the newest doc,")
+        print("and move the older one(s) to Trash in Google Drive.")
+
+    if unreadable:
+        print(f"\n⚠ {len(unreadable)} doc(s) could not be read (no granola_id extracted):")
+        for doc_id in unreadable:
+            print(f"    https://docs.google.com/document/d/{doc_id}/edit")
+
+    print(f"\nTotal docs scanned: {len(doc_ids)}  |  Duplicated meetings: {len(dupes)}  "
+          f"|  Unreadable: {len(unreadable)}")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1459,10 +1544,15 @@ if __name__ == "__main__":
     parser.add_argument("--check", action="store_true",
                         help="Verify prerequisites (Python version, CA cert, keychain token, "
                              "Granola auth, MCP gateway) and print a ✓ / ✗ status for each")
+    parser.add_argument("--find-dupes", action="store_true",
+                        help="Scan the Drive folder and report any meetings with more than one "
+                             "synced doc so you can manually remove the older copies")
     args = parser.parse_args()
 
     if args.check:
         sys.exit(0 if check_setup() else 1)
+    elif args.find_dupes:
+        find_duplicate_docs(folder_name=args.folder_name)
     elif args.test:
         test_single_meeting(args.test, folder_name=args.folder_name)
     elif args.backfill_transcripts:
