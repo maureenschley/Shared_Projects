@@ -284,23 +284,22 @@ def _refresh_adaptor_token(blob: dict) -> str:
         new_tokens = json.loads(resp.read().decode())
 
     access_token = new_tokens["access_token"]
-    blob["access_token"] = access_token
-    if "refresh_token" in new_tokens:
-        blob["refresh_token"] = new_tokens["refresh_token"]
-    blob["last_refreshed"] = datetime.now(timezone.utc).isoformat()
-
-    # Write back to keychain
-    new_raw = base64.b64encode(json.dumps(blob).encode()).decode()
-    subprocess.run(
-        ["security", "add-generic-password", "-U",
-         "-s", ADAPTOR_SERVICE, "-a", ADAPTOR_ACCOUNT, "-w", new_raw],
-        capture_output=True, check=True
-    )
+    # Do NOT write back to keychain — Claude Code owns that entry and concurrent
+    # writes cause refresh-token rotation conflicts. Return the fresh token for
+    # in-memory use only; Claude Code will update the keychain on its next run.
     return access_token
 
 
 def get_adaptor_token() -> str:
-    """Read the Salesforce MCP gateway token from the keychain, refreshing if expired."""
+    """Read the Salesforce MCP gateway token from the keychain, refreshing if expired.
+
+    If the token is expired, attempts a Keycloak refresh using the stored
+    refresh_token. The refreshed token is used in-memory only — the keychain
+    is not written back to avoid conflicts with Claude Code's own token management.
+
+    If the refresh fails (e.g. the refresh_token itself has expired), raises a
+    RuntimeError with instructions for the user.
+    """
     _, blob = _read_adaptor_blob()
     access_token = blob.get("access_token", "")
 
@@ -308,7 +307,6 @@ def get_adaptor_token() -> str:
     expires_at_str = blob.get("expires_at", "")
     if expires_at_str and access_token:
         try:
-            # Parse the ISO timestamp (handles both Z and ±HH:MM offsets)
             expires_at = datetime.fromisoformat(expires_at_str)
             now = datetime.now(timezone.utc)
             if expires_at.tzinfo is None:
@@ -317,8 +315,18 @@ def get_adaptor_token() -> str:
                 print("  ↻ MCP adaptor token expired — refreshing…")
                 access_token = _refresh_adaptor_token(blob)
                 print("  ✓ Token refreshed.")
+        except urllib.error.HTTPError as e:
+            if e.code == 400:
+                raise RuntimeError(
+                    "Token refresh failed (HTTP 400) — the refresh token in the keychain "
+                    "is no longer valid.\n\n"
+                    "Fix: open Claude Code, use any Google Workspace tool (e.g. ask it to "
+                    "list your Drive), then re-run this script. Claude Code will write a "
+                    "fresh token to the keychain automatically."
+                ) from e
+            raise
         except Exception as e:
-            print(f"  ⚠ Could not check token expiry: {e}", file=sys.stderr)
+            raise RuntimeError(f"Token refresh failed: {e}") from e
 
     return access_token
 
