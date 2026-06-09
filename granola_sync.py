@@ -740,7 +740,8 @@ class GWorkspaceClient:
         tab2_match = re.search(r"tab_id:\s*([\w.]+)", result_text or "")
         tab2_id_from_result = tab2_match.group(1) if tab2_match else ""
 
-        # e) Resolve Transcript tab ID — use result text first, fall back to inspect
+        # e) Resolve Transcript tab ID — use result text first, fall back to inspect,
+        #    then fall back to Google Docs naming convention ("t.1" = second tab).
         tab2_id = tab2_id_from_result
         if not tab2_id:
             structure2 = self.inspect_doc(doc_id)
@@ -748,6 +749,11 @@ class GWorkspaceClient:
                 if tab.get("tab_id") != tab1_id:
                     tab2_id = tab.get("tab_id", "")
                     break
+        if not tab2_id:
+            # Google Docs always assigns t.0, t.1, t.2 ... in creation order.
+            tab2_id = "t.1"
+            print(f"           ↳ tab2_id not found via API result or inspect; "
+                  f"using 't.1' fallback")
 
         # f) Write transcript content to Tab 2
         tab2_text = transcript_content if transcript_content else "_No transcript available._\n"
@@ -995,10 +1001,18 @@ def build_synced_index(gw: GWorkspaceClient, folder_id: str,
                 body = gw.call_tool("get_doc_as_markdown",
                                     {"document_id": doc_id, "tab_id": "t.0"})
             m = GRANOLA_ID_RE.search(body)
+            if not m:
+                # Default call sometimes returns non-error content that still lacks
+                # the granola_id (e.g. wrong tab, truncated, or malformed response).
+                # Always retry explicitly on the Notes tab (t.0) before giving up.
+                body_t0 = gw.call_tool("get_doc_as_markdown",
+                                       {"document_id": doc_id, "tab_id": "t.0"})
+                m = GRANOLA_ID_RE.search(body_t0)
             if m:
                 index[m.group(1)] = doc_id
-            elif verbose:
-                print(f"    ⚠ No granola_id found in {doc_id}")
+            else:
+                print(f"    ⚠ No granola_id in {doc_id} (checked default + t.0) — "
+                      f"may cause duplicate on next sync", file=sys.stderr)
         except Exception as e:
             skipped.append((doc_id, str(e)))
     if skipped:
@@ -1185,6 +1199,8 @@ def sync(days: int = 30, folder_name: str = "Granola Meeting Notes", dry_run: bo
                     transcript = granola_get_transcript(granola_token, mid)
                     if transcript:
                         print(f"           ↳ Transcript: {len(transcript)} chars")
+                    else:
+                        print(f"           ↳ No transcript from Granola (meeting may not have been recorded)")
                 except Exception as e:
                     print(f"           ↳ Transcript fetch failed ({e}), continuing without")
 
