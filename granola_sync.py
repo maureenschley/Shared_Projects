@@ -43,6 +43,7 @@ from pathlib import Path
 GRANOLA_MCP_URL = "https://mcp.granola.ai/mcp"
 GRANOLA_AUTH_SERVER = "https://mcp-auth.granola.ai"
 GRANOLA_TOKEN_FILE = Path.home() / ".granola_sync_tokens.json"
+SYNC_CONFIG_FILE = Path.home() / ".granola_sync_config.json"
 OAUTH_REDIRECT_PORT = 8765
 OAUTH_REDIRECT_URI = f"http://localhost:{OAUTH_REDIRECT_PORT}/callback"
 
@@ -64,6 +65,30 @@ ADAPTOR_ACCOUNT = os.environ.get(
 GRANOLA_ID_RE = re.compile(
     r"(?:<!--\s*granola_id:\s*|Granola Meeting ID:\s*)([0-9a-f-]{36})"
 )
+
+# ---------------------------------------------------------------------------
+# Persistent config (~/.granola_sync_config.json)
+# ---------------------------------------------------------------------------
+
+def load_config() -> dict:
+    """Load persistent config, returning {} if missing or unreadable."""
+    if SYNC_CONFIG_FILE.exists():
+        try:
+            with open(SYNC_CONFIG_FILE) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+
+def save_config(data: dict):
+    """Merge *data* into the persistent config and write atomically."""
+    existing = load_config()
+    existing.update(data)
+    with open(SYNC_CONFIG_FILE, "w") as f:
+        json.dump(existing, f, indent=2)
+    SYNC_CONFIG_FILE.chmod(0o600)
+
 
 # ---------------------------------------------------------------------------
 # Granola OAuth (mcp-auth.granola.ai) — PKCE auth_code flow
@@ -604,17 +629,44 @@ class GWorkspaceClient:
         return self.call_tool("get_doc_as_markdown", {"document_id": doc_id})
 
     def ensure_folder(self, folder_name: str) -> str:
-        """Find or create a Drive folder; return its ID."""
+        """Find or create a Drive folder; return its ID.
+
+        Stores the folder ID in ~/.granola_sync_config.json after the first
+        successful lookup.  Subsequent runs use the cached ID directly and
+        skip the Drive search entirely — so a transient search failure can
+        never accidentally trigger creation of a duplicate folder.
+        """
+        config_key = "folder_id_" + folder_name.lower().replace(" ", "_")
+
+        # 1. Use stored ID if we have one — verify it's still valid.
+        stored_id = load_config().get(config_key)
+        if stored_id:
+            try:
+                self.call_tool("get_drive_file_permissions", {"file_id": stored_id})
+                return stored_id
+            except Exception:
+                print(f"  ⚠ Stored folder ID {stored_id} no longer valid, re-searching…")
+
+        # 2. Fall back to a name-exact Drive search.
         results = self.call_tool("search_drive_files", {
-            "query": folder_name,
+            "query": f"name = '{folder_name}'",
             "file_type": "folder",
         })
         ids = re.findall(r"ID[:\s]+([A-Za-z0-9_-]{25,})", results)
         if ids:
-            return ids[0]
+            folder_id = ids[0]
+            save_config({config_key: folder_id})
+            print(f"  ✓ Folder found — ID cached to {SYNC_CONFIG_FILE.name}")
+            return folder_id
+
+        # 3. Create only if the folder truly doesn't exist.
+        print(f"  Drive folder '{folder_name}' not found — creating…")
         text = self.call_tool("create_drive_folder", {"folder_name": folder_name})
         m = re.search(r"ID[:\s]+([A-Za-z0-9_-]{25,})", text)
-        return m.group(1) if m else ""
+        folder_id = m.group(1) if m else ""
+        if folder_id:
+            save_config({config_key: folder_id})
+        return folder_id
 
     def move_to_folder(self, file_id: str, folder_id: str):
         self.call_tool("update_drive_file", {
